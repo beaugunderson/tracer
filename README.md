@@ -3,6 +3,8 @@
 An mtr-style continuous traceroute with braille-sparkline latency history and
 simultaneous IPv4 + IPv6 paths.
 
+![tracer running against dns.google over both IPv4 and IPv6, with per-hop braille sparklines and a recent-outages panel](docs/screenshot.png)
+
 ```
 tracer  kaiton.local  ·  last 280 pings                    2026-06-25T22:47:30-0700
 
