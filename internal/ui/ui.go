@@ -216,20 +216,36 @@ func renderOutages(views []trace.SessionView, now time.Time) string {
 		head += dimStyle.Render("   " + strings.Join(hints, " · "))
 	}
 
-	var b strings.Builder
-	b.WriteString(head)
 	const maxShown = 6
-	for i, e := range entries {
-		if i >= maxShown {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("\n  …and %d more", len(entries)-maxShown)))
-			break
-		}
+	shown := entries
+	if len(shown) > maxShown {
+		shown = shown[:maxShown]
+	}
+
+	// Size the duration column to the widest value shown so a long outage
+	// (e.g. "19m50s") doesn't shove the "ago" column out of alignment.
+	type row struct{ fam, dur, when string }
+	rows := make([]row, len(shown))
+	durW := 0
+	for i, e := range shown {
 		dur := shortDur(e.o.Duration(now))
 		when := shortDur(now.Sub(e.o.End)) + " ago"
 		if e.o.Ongoing() {
 			when = "ongoing"
 		}
-		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  %-3s %5s   %s", e.family, dur, when)))
+		rows[i] = row{e.family, dur, when}
+		if len(dur) > durW {
+			durW = len(dur)
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(head)
+	for _, r := range rows {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  %-3s %*s   %s", r.fam, durW, r.dur, r.when)))
+	}
+	if len(entries) > maxShown {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  …and %d more", len(entries)-maxShown)))
 	}
 	return b.String()
 }

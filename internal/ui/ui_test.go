@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -160,3 +161,46 @@ func TestPeriodicity(t *testing.T) {
 		t.Errorf("too few outages should not be called periodic")
 	}
 }
+
+// TestRenderOutagesAlignment guards the "ago" column staying aligned when a long
+// outage duration (e.g. 19m50s) sits alongside a short one; a fixed-width column
+// let the long value overflow and shove the "ago" text out of line.
+func TestRenderOutagesAlignment(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	mk := func(durSecs, endedAgoSecs int) trace.Outage {
+		end := now.Add(-time.Duration(endedAgoSecs) * time.Second)
+		return trace.Outage{Start: end.Add(-time.Duration(durSecs) * time.Second), End: end}
+	}
+	views := []trace.SessionView{{
+		Family: "IPv4",
+		Outages: []trace.Outage{
+			mk(22, 925),    // short: "22s"
+			mk(1190, 1536), // long: "19m50s"
+		},
+	}}
+
+	out := stripANSI(renderOutages(views, now))
+	var offsets []int
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, " ")
+		if !strings.HasSuffix(line, " ago") {
+			continue
+		}
+		// The when field follows a 3-space column separator; its start offset must
+		// be identical across rows for the columns to line up.
+		offsets = append(offsets, strings.LastIndex(line, "   ")+3)
+	}
+	if len(offsets) != 2 {
+		t.Fatalf("expected 2 outage rows, got %d:\n%s", len(offsets), out)
+	}
+	if offsets[0] != offsets[1] {
+		t.Errorf("when column misaligned: offsets %v\n%s", offsets, out)
+	}
+}
+
+// stripANSI removes SGR color escapes so tests can assert on column positions.
+func stripANSI(s string) string {
+	return ansiSGR.ReplaceAllString(s, "")
+}
+
+var ansiSGR = regexp.MustCompile("\x1b\\[[0-9;]*m")
