@@ -26,6 +26,11 @@ const (
 	colGutter = 2
 )
 
+// deprioTag replaces the latency+jitter columns for an ICMP-deprioritized hop
+// (HopView.Deprioritized). Kept within colLast+1+colJitter (14) so sparklines
+// stay column-aligned.
+const deprioTag = "deprioritized"
+
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true)
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
@@ -542,6 +547,28 @@ func renderHop(h trace.HopView, ceiling time.Duration, sparkW, maxRound int, col
 		jitter = fmt.Sprintf("%7s", "±"+formatMS(h.Jitter))
 	}
 
+	// An ICMP-deprioritized hop's Last/Jitter are dominated by its control-plane
+	// queue delay, not path latency, so replace those two columns with a tag and
+	// grey the *whole* row — sparkline included (rendered mono, loss as ×, then
+	// dimmed) — so the eye skips it. The tag fills exactly the last+space+jitter
+	// span so every row's sparkline stays column-aligned.
+	if h.Deprioritized {
+		lastJit := colLast + 1 + colJitter
+		tag := truncate(deprioTag, lastJit)
+		tag += strings.Repeat(" ", max0(lastJit-lipgloss.Width(tag)))
+		host := truncate(h.Host, colHost)
+		hostCell := host + strings.Repeat(" ", max0(colHost-lipgloss.Width(host)))
+		runes, _ := sparkRunes(h.Samples, ceiling, sparkW, maxRound, false)
+		spark := dimStyle.Render(string(runes))
+		cols := []string{dimStyle.Render(idx), dimStyle.Render(hostCell)}
+		if asn {
+			a := truncate(h.ASN, colASN)
+			cols = append(cols, dimStyle.Render(a+strings.Repeat(" ", max0(colASN-lipgloss.Width(a)))))
+		}
+		cols = append(cols, dimStyle.Render(loss), dimStyle.Render(tag))
+		return strings.Join(cols, " ") + strings.Repeat(" ", colGutter) + spark
+	}
+
 	spark := renderSpark(h.Samples, ceiling, sparkW, maxRound, color)
 
 	cols := []string{dimStyle.Render(idx), hostCell}
@@ -560,6 +587,14 @@ func renderHop(h trace.HopView, ceiling time.Duration, sparkW, maxRound int, col
 // shows immediately. Rounds with no sample render blank, so a hop missing the
 // latest round shows a blank right edge until its reply lands — live and aligned.
 func renderSpark(samples []trace.SampleView, ceiling time.Duration, sparkW, maxRound int, color bool) string {
+	runes, keys := sparkRunes(samples, ceiling, sparkW, maxRound, color)
+	return renderRuns(runes, keys)
+}
+
+// sparkRunes buckets the samples into the aligned glyph columns and returns the
+// glyphs plus a per-glyph style key (keyLoss / gradient index / keyPlain). See
+// renderSpark for the column-alignment scheme.
+func sparkRunes(samples []trace.SampleView, ceiling time.Duration, sparkW, maxRound int, color bool) ([]rune, []int) {
 	points := make(map[int]sparkline.Point, len(samples))
 	rtts := make(map[int]time.Duration, len(samples))
 	var rowMin, rowMax time.Duration
@@ -605,7 +640,7 @@ func renderSpark(samples []trace.SampleView, ceiling time.Duration, sparkW, maxR
 		runes = append(runes, r)
 		keys = append(keys, key)
 	}
-	return renderRuns(runes, keys)
+	return runes, keys
 }
 
 // renderRuns emits the glyphs, applying a style per run of equal keys so a
@@ -672,8 +707,12 @@ func renderFooter(color bool, width int) string {
 		lossGlyph = string(lossRune)
 	}
 	loss := lossStyle.Render(lossGlyph + " = loss")
+	deprio := dimStyle.Render(deprioTag + " = replies chronically past timeout")
 	keys := dimStyle.Render("q quit · r reset stats")
 	essential := fmt.Sprintf("%s   %s   %s", bars, loss, keys)
+	if w := lipgloss.Width(essential + "   " + deprio); w <= width {
+		essential = fmt.Sprintf("%s   %s   %s   %s", bars, loss, deprio, keys)
+	}
 
 	if !color {
 		return essential

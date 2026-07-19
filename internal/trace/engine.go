@@ -417,7 +417,6 @@ func (e *engine) recordReply(seq uint16, peer net.Addr) {
 	if wasLost {
 		// The sweeper already counted this probe lost; the reply straggled in
 		// inside the grace window, so credit it back and repair the stats.
-		pp.s.late = true
 		h.creditOK(rtt, pp.sentAt)
 	} else {
 		h.noteOK(rtt, pp.sentAt)
@@ -513,12 +512,14 @@ func (e *engine) sweep(now time.Time) {
 		grace = g // an unusually long -t must not out-live its own grace
 	}
 	e.s.mu.Lock()
+	// The lost-timeout adapts to the measured path RTT, capped by the user's -t.
+	rto := e.s.rtoLocked(e.opts.Timeout)
 	for seq, pp := range e.s.pending {
 		age := now.Sub(pp.sentAt)
 		switch {
 		case age > grace:
 			delete(e.s.pending, seq)
-		case pp.s.state == Pending && age > e.opts.Timeout:
+		case pp.s.state == Pending && age > rto:
 			pp.s.state = Lost
 			e.s.getHop(pp.ttl).noteLost()
 		}

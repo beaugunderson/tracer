@@ -59,10 +59,18 @@ scale 0–102ms   ⣀ low → ⣿ high   ⣿ = packet loss   q quit · r reset s
   hop hostname/AS lookups that fail while DNS is down retry on their own, so it
   keeps monitoring and recovers on its own when the link returns. A reply that
   straggles in after the timeout (within 60s) is credited back, repairing the
-  loss stats — which exposes routers whose control plane answers tens of seconds
-  late (Starlink's PoP gateway does this) as a huge avg on an otherwise healthy
-  path. Late-credited replies don't inflate the bar scale, so such a hop can't
-  flatten the rest of the chart.
+  loss stats.
+- **Adaptive timeout.** The wait before a probe counts as lost tracks the measured
+  path RTT (per-hop Jacobson estimator, capped by `-t`), so loss shows in a
+  fraction of a second on a fast path instead of after a fixed 2s, while a
+  genuinely slow hop is never timed out early.
+- **Flags deprioritized routers.** Some routers deprioritize ICMP addressed to
+  themselves — their echo replies queue for tens of seconds while packets *through*
+  them stay fast (Starlink's PoP gateway does this). When such replies are the
+  majority for a hop, tracer greys the whole row and tags it `deprioritized`
+  instead of showing a misleading multi-second average, and those queued replies
+  never inflate the bar scale, so one deprioritized hop can't flatten the rest of
+  the chart.
 - **Dual-stack at once.** When a host resolves to both A and AAAA records, tracer
   runs two independent traceroutes — IPv4 on top, IPv6 below — so path-dependent
   problems (one family slow or broken) are immediately visible.
@@ -78,7 +86,7 @@ scale 0–102ms   ⣀ low → ⣿ high   ⣿ = packet loss   q quit · r reset s
 tracer [flags] <host>
 
   -i  interval between full probe cycles (default 0.5s)
-  -t  timeout before a probe counts as lost (default 2s)
+  -t  max timeout before a probe counts as lost (default 2s; adapts down to the path RTT)
   -m  maximum number of hops (default 30)
   -4  IPv4 only
   -6  IPv6 only

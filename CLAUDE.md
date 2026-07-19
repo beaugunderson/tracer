@@ -56,16 +56,33 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
 - Probes match replies by sequence number via the `pending` map. `hop.samples` is
   `[]*sample` (pointers) so trimming the ring never invalidates pending references.
 - The sweeper (`sweep`, called by `sweepLoop` every 200ms) decides probes in two
-  phases: past `Timeout` a probe is marked `Lost` (so loss shows promptly) but
-  **stays in `pending`**; past `lateGrace` (60s, or 2×Timeout if larger) it's
-  pruned. A reply inside the grace flips the sample back to `OK` via
+  phases: past the adaptive **RTO** a probe is marked `Lost` (so loss shows
+  promptly) but **stays in `pending`**; past `lateGrace` (60s, or 2×Timeout if
+  larger) it's pruned. A reply inside the grace flips the sample back to `OK` via
   `hop.creditOK` — recv/avg/best/worst/loss% self-repair; `Last`/`SinceOK` only
   move if the credited probe is the newest-sent OK. The grace must stay well
-  under the ~18-minute uint16 seq-wrap horizon. Credited samples are flagged
-  `late` and excluded from the family bar ceiling (`MaxRTT`): a hop whose
-  control plane answers ~30s late *continuously* (Starlink's PoP gateway) would
-  otherwise pin the ceiling and flatten every other row. Its own row still
-  shows them (full-height bars, honest loss/avg/worst).
+  under the ~18-minute uint16 seq-wrap horizon. Replies at or past
+  `queuedThreshold` (3s) are excluded from the family bar ceiling (`MaxRTT`): a
+  hop whose control plane answers ~30s late *continuously* (Starlink's PoP
+  gateway) would otherwise pin the ceiling and flatten every other row. Its own
+  row still shows them (full-height bars, honest loss/avg/worst).
+- The lost-timeout is **adaptive** (`Session.rtoLocked`): a per-hop Jacobson/Karels
+  estimator (`hop.updateRTO`, srtt + 4·rttvar) trained on that hop's prompt replies
+  (those under `queuedThreshold`, so a chronically-queued hop can't inflate it),
+  and the path RTO is the **max across hops** so the slowest legit hop sets the
+  bar and no honest hop is timed out early. Clamped to [`rtoFloor` 250ms, the
+  user's `-t`]: `-t` is the ceiling the timeout only tightens *below*, never
+  loosens past; falls back to the ceiling until a hop has a prompt reply. This is
+  why loss shows in a fraction of a second on a fast path instead of after 2s.
+- A hop is flagged `HopView.Deprioritized` when queued replies (past
+  `queuedThreshold`) are the majority of its replies (`h.queuedRecv/h.recv ≥
+  deprioRatio` 0.5, with `recv ≥ deprioMinRecv` 10). The threshold is a fixed
+  absolute bound, not relative to the (adaptive) RTO or to other hops, so a
+  genuinely slow-but-prompt link never trips it and the detection reference stays
+  stable while the timeout adapts around it. The UI (`renderHop`) greys the whole
+  row — sparkline included (rendered mono via `sparkRunes`, loss as `×`, then
+  dimmed) — and replaces the misleading latency+jitter columns with the
+  `deprioTag` (`deprioritized`). `-report` keeps the raw numbers.
 - `extractEcho` also checks the quoted inner packet's ICMP type byte (echo
   request: 8 v4 / 128 v6), so quoted traffic from another program colliding on
   id can't match.
@@ -75,11 +92,19 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
   `interval/maxHops` apart — never clamped. So the whole path appears within ~one
   round-trip AND the path tracks route changes live (grows/shrinks/reroutes). The
   cost is a few echoes to TTLs past the destination each cycle; cheap.
-- The displayed path length is derived **per snapshot** in `Snapshot`: the
-  destination is the smallest TTL whose hop address equals `TargetIP`, and hops
-  past it are hidden. There is no stored `destTTL` floor (an earlier min-only floor
-  both froze the path and let a stray low reply collapse it). `DestFound` = some
-  hop answered as the target.
+- The displayed path length is derived **per snapshot** via `destTTLLocked`: the
+  destination is the smallest TTL whose hop address equals `TargetIP` **with
+  fresh evidence** (last reply within `destChooseWindow` of the freshest
+  target-labeled hop's). Freshness matters: the target occasionally answers a
+  low-TTL probe for real (Starlink CGNAT re-originating packets with a fresh
+  TTL during congestion), and if that TTL's real router is silent the label
+  never gets overwritten — a plain smallest-TTL rule then collapses the path
+  there permanently and fakes an outage (false OFFLINE). During a real outage
+  all candidates are equally stale, so all pass and the choice is stable. A
+  target-labeled hop below the chosen TTL whose evidence lags by
+  `destClearAfter` (60s) is provably mislabeled and has its address cleared.
+  `destDownLocked` (outage tracking) uses the same selection. Hops past the
+  destination are hidden; `DestFound` = a destination was chosen.
 - Every probe is stamped with a global round number (`Session.roundNo`). The UI
   renders the sparkline by bucketing each ping into glyph `round/2` (even round →
   left dot, odd → right dot) — see `renderSpark`. This keeps a ping in the same

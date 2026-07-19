@@ -23,7 +23,7 @@ func main() {
 	var report time.Duration
 	var mono bool
 	flag.DurationVar(&opts.Interval, "i", opts.Interval, "interval between probe rounds")
-	flag.DurationVar(&opts.Timeout, "t", opts.Timeout, "timeout before a probe is counted as lost")
+	flag.DurationVar(&opts.Timeout, "t", opts.Timeout, "max timeout before a probe is counted as lost (adapts down to the measured path RTT)")
 	flag.IntVar(&opts.MaxHops, "m", opts.MaxHops, "maximum number of hops")
 	flag.BoolVar(&opts.Force4, "4", false, "use IPv4 only")
 	flag.BoolVar(&opts.Force6, "6", false, "use IPv6 only")

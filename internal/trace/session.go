@@ -25,7 +25,6 @@ type sample struct {
 	sentAt time.Time
 	rtt    time.Duration
 	state  SampleState
-	late   bool // credited after the timeout; excluded from the bar ceiling
 }
 
 // hop is one TTL position in the path. Addresses can change between probes
@@ -43,15 +42,22 @@ type hop struct {
 	// Running aggregates over the hop's whole lifetime. The samples ring is
 	// capped, so it only backs the sparkline window; the cumulative stat columns
 	// come from these, updated as each probe is decided.
-	sent     int // decided probes (OK + Lost)
-	recv     int // OK probes
-	sumRTT   time.Duration
-	sumMs    float64 // running Σrtt and Σrtt² in ms, for jitter (stddev)
-	sumSqMs  float64
-	best     time.Duration
-	worst    time.Duration
-	last     time.Duration // RTT of the newest-sent OK probe
-	lastOKAt time.Time     // send time of the newest-sent OK probe
+	sent       int // decided probes (OK + Lost)
+	recv       int // OK probes
+	queuedRecv int // replies slower than queuedThreshold (control-plane queue, not path latency)
+	sumRTT     time.Duration
+	sumMs      float64 // running Σrtt and Σrtt² in ms, for jitter (stddev)
+	sumSqMs    float64
+	best       time.Duration
+	worst      time.Duration
+	last       time.Duration // RTT of the newest-sent OK probe
+	lastOKAt   time.Time     // send time of the newest-sent OK probe
+
+	// Jacobson/Karels RTT estimator over this hop's prompt replies (those under
+	// queuedThreshold, so a chronically-queued hop's tens-of-seconds replies
+	// never train it). Drives the adaptive lost-timeout (see Session.rtoLocked).
+	srtt   time.Duration // smoothed RTT
+	rttvar time.Duration // smoothed mean RTT deviation
 }
 
 // noteLost counts a probe decided as lost.
@@ -68,6 +74,11 @@ func (h *hop) noteOK(rtt time.Duration, sentAt time.Time) {
 // late and flips back to OK.
 func (h *hop) creditOK(rtt time.Duration, sentAt time.Time) {
 	h.recv++
+	if rtt >= queuedThreshold {
+		h.queuedRecv++ // control-plane queue delay, not path latency
+	} else {
+		h.updateRTO(rtt) // only prompt replies train the timeout estimator
+	}
 	h.sumRTT += rtt
 	ms := float64(rtt) / float64(time.Millisecond)
 	h.sumMs += ms
@@ -86,7 +97,45 @@ func (h *hop) creditOK(rtt time.Duration, sentAt time.Time) {
 	}
 }
 
+// updateRTO folds one prompt reply into the Jacobson/Karels estimator, using the
+// standard gains (1/4 for the deviation, 1/8 for the smoothed RTT). The first
+// sample seeds srtt=rtt, rttvar=rtt/2.
+func (h *hop) updateRTO(rtt time.Duration) {
+	if h.srtt == 0 {
+		h.srtt = rtt
+		h.rttvar = rtt / 2
+		return
+	}
+	err := rtt - h.srtt
+	if err < 0 {
+		err = -err
+	}
+	h.rttvar += (err - h.rttvar) / 4
+	h.srtt += (rtt - h.srtt) / 8
+}
+
+// rtoEstimate is this hop's retransmit timeout (srtt + 4·rttvar), or 0 if the
+// estimator has no prompt samples yet.
+func (h *hop) rtoEstimate() time.Duration {
+	if h.srtt == 0 {
+		return 0
+	}
+	return h.srtt + 4*h.rttvar
+}
+
 const sampleCap = 4096
+
+// queuedThreshold separates legit path/ICMP-generation latency from control-plane
+// queueing. No real internet hop answers ICMP-to-itself this slowly (even a
+// geostationary satellite double-hop is ~1.2s), so a reply at or above it is a
+// queued control-plane reply: excluded from the RTT estimator and the bar
+// ceiling, and counted toward the deprioritization flag. Fixed on purpose — the
+// detection reference must stay stable while the lost-timeout adapts around it.
+const queuedThreshold = 3 * time.Second
+
+// rtoFloor bounds the adaptive lost-timeout from below so a very stable, fast
+// path (LAN-tight jitter) still tolerates a modest spike before showing loss.
+const rtoFloor = 250 * time.Millisecond
 
 // DownThreshold is how long without a reply from the destination before it's
 // treated as offline — used by the connectivity banner and outage tracking.
@@ -94,8 +143,30 @@ const DownThreshold = 1500 * time.Millisecond
 
 const maxOutages = 50
 
+// Freshness thresholds for destination selection (see destTTLLocked).
+const (
+	// destChooseWindow: a target-labeled hop is a live destination candidate only
+	// if its last reply is within this window of the freshest candidate's. Wide
+	// enough to ride out per-row loss streaks, far narrower than stuck-label
+	// staleness (minutes).
+	destChooseWindow = 5 * time.Second
+	// destClearAfter: a target-labeled hop below the chosen destination whose
+	// evidence lags the freshest by this much is provably mislabeled and gets
+	// its address cleared so the row heals.
+	destClearAfter = 60 * time.Second
+)
+
 // recentWindow is how many recent replies the displayed latency averages over.
 const recentWindow = 5
+
+// Thresholds for flagging a hop as ICMP-deprioritized (see HopView.Deprioritized).
+// A reply counts as queued only past queuedThreshold (a fixed absolute bound), so
+// a merely slow-but-prompt link never counts; the ratio requires queued replies
+// to be the hop's characteristic behavior, not an occasional spike.
+const (
+	deprioMinRecv = 10  // need enough replies to judge
+	deprioRatio   = 0.5 // ≥ half of replies arrive queued (past queuedThreshold)
+)
 
 // Outage is one episode where the destination was unreachable. End is zero while
 // the outage is still ongoing.
@@ -162,9 +233,10 @@ func (s *Session) Reset() {
 	defer s.mu.Unlock()
 	for _, h := range s.hops {
 		h.samples = nil
-		h.sent, h.recv = 0, 0
+		h.sent, h.recv, h.queuedRecv = 0, 0, 0
 		h.sumRTT, h.sumMs, h.sumSqMs = 0, 0, 0
 		h.best, h.worst, h.last = 0, 0, 0
+		h.srtt, h.rttvar = 0, 0
 		h.lastOKAt = time.Time{}
 	}
 	s.pending = make(map[uint16]*pendingProbe)
@@ -194,6 +266,14 @@ type HopView struct {
 	Worst   time.Duration
 	Jitter  time.Duration // stddev of RTT over received probes
 	SinceOK time.Duration // time since the most recent reply; <0 if never replied
+
+	// Deprioritized marks a hop whose ICMP replies to itself are chronically
+	// queued: the majority of its replies arrive only after the per-probe
+	// timeout (control-plane rate limiting, e.g. Starlink's PoP gateway). Its
+	// Last/Avg/Worst are dominated by that queue delay, not the path latency
+	// packets *through* it see, so the UI tags the row instead of showing the
+	// misleading number.
+	Deprioritized bool
 }
 
 // SessionView is a read-only snapshot of a whole traceroute.
@@ -214,18 +294,15 @@ func (s *Session) Snapshot(maxSamples int) SessionView {
 	defer s.mu.Unlock()
 
 	// Derive the path length every snapshot from which hop currently answers as
-	// the target (its address equals the target IP). The smallest such TTL is the
-	// destination; everything past it is hidden. This tracks route changes live —
-	// the path grows, shrinks, and reroutes on its own with no frozen ceiling.
-	maxKey, destTTL := 0, 0
-	for ttl, h := range s.hops {
+	// the target. Everything past the destination is hidden. This tracks route
+	// changes live — the path grows, shrinks, and reroutes with no frozen ceiling.
+	maxKey := 0
+	for ttl := range s.hops {
 		if ttl > maxKey {
 			maxKey = ttl
 		}
-		if h.addr != nil && h.addr.Equal(s.TargetIP) && (destTTL == 0 || ttl < destTTL) {
-			destTTL = ttl
-		}
 	}
+	destTTL := s.destTTLLocked()
 	maxTTL := maxKey
 	if destTTL > 0 {
 		maxTTL = destTTL
@@ -292,18 +369,20 @@ func (s *Session) Snapshot(maxSamples int) SessionView {
 		if hv.Sent > 0 {
 			hv.LossPct = 100 * float64(hv.Sent-hv.Recv) / float64(hv.Sent)
 		}
+		hv.Deprioritized = h.recv >= deprioMinRecv &&
+			float64(h.queuedRecv) >= deprioRatio*float64(h.recv)
 
 		hv.Samples = make([]SampleView, len(samples))
 		for i, sm := range samples {
 			hv.Samples[i] = SampleView{State: sm.state, RTT: sm.rtt, Round: sm.round}
 			// The height scale tracks only the visible window, so it recovers
 			// once an old spike scrolls off (stats columns keep full history).
-			// Late-credited replies are excluded: a hop whose control plane
-			// answers tens of seconds late (Starlink's PoP gateway does this
-			// continuously) would otherwise pin the ceiling and flatten every
-			// other row's bars. Its own row still shows them — full-height bars,
-			// and honest loss/avg/worst columns.
-			if sm.state == OK && !sm.late && sm.rtt > view.MaxRTT {
+			// Queued replies are excluded: a hop whose control plane answers tens
+			// of seconds late (Starlink's PoP gateway does this continuously)
+			// would otherwise pin the ceiling and flatten every other row's bars.
+			// Its own row still shows them — full-height bars, and honest
+			// loss/avg/worst columns.
+			if sm.state == OK && sm.rtt < queuedThreshold && sm.rtt > view.MaxRTT {
 				view.MaxRTT = sm.rtt
 			}
 		}
@@ -337,16 +416,55 @@ func (s *Session) updateOutagesLocked(now time.Time) {
 	}
 }
 
-// destDownLocked reports whether the current destination hop (smallest TTL whose
-// address is the target) has gone longer than DownThreshold without a reply, plus
-// the time of its last reply. Callers hold mu.
-func (s *Session) destDownLocked(now time.Time) (bool, time.Time) {
-	destTTL := 0
-	for ttl, h := range s.hops {
-		if h.addr != nil && h.addr.Equal(s.TargetIP) && (destTTL == 0 || ttl < destTTL) {
-			destTTL = ttl
+// destTTLLocked picks the destination TTL: among hops whose address is the
+// target, take the smallest with *fresh* evidence — a last reply within
+// destChooseWindow of the freshest candidate's. Recency matters because a
+// transient route change (Starlink briefly handing off straight into the
+// target's network) can stamp the target's address onto a low TTL whose real
+// router is silent; a plain smallest-TTL rule would then collapse the path
+// there forever and fake a permanent outage. During a real outage (or right
+// after Reset) every candidate is equally stale, so all pass the filter and
+// the choice stays stable. A candidate below the chosen TTL whose evidence
+// lags by destClearAfter is provably mislabeled — the destination cannot be at
+// two distances — and gets its address cleared so the row heals. Callers hold
+// mu; this may mutate mislabeled hops.
+func (s *Session) destTTLLocked() int {
+	var newest time.Time
+	for _, h := range s.hops {
+		if h.addr != nil && h.addr.Equal(s.TargetIP) && h.lastOKAt.After(newest) {
+			newest = h.lastOKAt
 		}
 	}
+	dest := 0
+	for ttl, h := range s.hops {
+		if h.addr == nil || !h.addr.Equal(s.TargetIP) {
+			continue
+		}
+		if newest.Sub(h.lastOKAt) > destChooseWindow {
+			continue
+		}
+		if dest == 0 || ttl < dest {
+			dest = ttl
+		}
+	}
+	if dest > 0 {
+		for ttl, h := range s.hops {
+			if ttl < dest && h.addr != nil && h.addr.Equal(s.TargetIP) &&
+				newest.Sub(h.lastOKAt) > destClearAfter {
+				h.addr = nil
+				h.host, h.asn = "", ""
+				h.hostDone, h.asnDone = false, false
+			}
+		}
+	}
+	return dest
+}
+
+// destDownLocked reports whether the current destination hop has gone longer
+// than DownThreshold without a reply, plus the time of its last reply. Callers
+// hold mu.
+func (s *Session) destDownLocked(now time.Time) (bool, time.Time) {
+	destTTL := s.destTTLLocked()
 	if destTTL == 0 {
 		return false, time.Time{} // no destination known yet — not an outage
 	}
@@ -357,4 +475,29 @@ func (s *Session) destDownLocked(now time.Time) (bool, time.Time) {
 	// No reply on record. Probes decided as lost are evidence of an outage; an
 	// empty record (e.g. right after a stats reset) is unknown, not an outage.
 	return h.sent > 0, time.Time{}
+}
+
+// rtoLocked is the adaptive lost-timeout: the largest per-hop RTO across the
+// path, so the slowest *legit* hop sets the bar and no honest hop is timed out
+// early. A chronically-queued hop can't inflate it (its slow replies never train
+// the estimator). Clamped to [rtoFloor, ceiling]; ceiling is the user's -t, so
+// the timeout only tightens below it, never loosens past it. Falls back to the
+// ceiling until some hop has a prompt reply. Callers hold mu.
+func (s *Session) rtoLocked(ceiling time.Duration) time.Duration {
+	var rto time.Duration
+	for _, h := range s.hops {
+		if r := h.rtoEstimate(); r > rto {
+			rto = r
+		}
+	}
+	if rto == 0 {
+		return ceiling
+	}
+	if rto < rtoFloor {
+		rto = rtoFloor
+	}
+	if rto > ceiling {
+		rto = ceiling
+	}
+	return rto
 }

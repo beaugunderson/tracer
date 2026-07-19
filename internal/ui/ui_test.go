@@ -235,6 +235,40 @@ func TestMonoLossGlyph(t *testing.T) {
 	}
 }
 
+// TestDeprioritizedHopTag: a flagged hop shows the tag instead of its misleading
+// tens-of-seconds latency/jitter, and the row width still matches a normal row so
+// sparklines stay column-aligned.
+func TestDeprioritizedHopTag(t *testing.T) {
+	deprio := trace.HopView{
+		TTL: 4, Host: "206.224.64.202", ASN: "STARLINK",
+		Sent: 100, Recv: 80, LossPct: 20,
+		Last: 40 * time.Second, Recent: 40 * time.Second, Worst: 42 * time.Second,
+		Deprioritized: true,
+		Samples:       sampleSeq(40000, 40000, 40000, 40000),
+	}
+	normal := trace.HopView{
+		TTL: 5, Host: "206.224.66.157", ASN: "STARLINK",
+		Sent: 100, Recv: 96, LossPct: 4,
+		Recent:  33 * time.Millisecond,
+		Samples: sampleSeq(33, 34, 33, 35),
+	}
+	ceiling := 250 * time.Millisecond
+
+	got := stripANSI(renderHop(deprio, ceiling, 4, 4, true, true))
+	if !strings.Contains(got, deprioTag) {
+		t.Errorf("deprioritized row should show the tag %q, got %q", deprioTag, got)
+	}
+	if strings.Contains(got, "40000ms") || strings.Contains(got, "40.0s") {
+		t.Errorf("deprioritized row must not show the misleading latency, got %q", got)
+	}
+
+	// The tag fills exactly the latency+jitter span, so both rows are the same width.
+	want := lipgloss.Width(stripANSI(renderHop(normal, ceiling, 4, 4, true, true)))
+	if w := lipgloss.Width(got); w != want {
+		t.Errorf("deprioritized row width %d != normal row width %d (breaks sparkline alignment)", w, want)
+	}
+}
+
 // TestRenderFrameShedsOnSmallHeight: extras shed in order (outages, then the
 // footer legend, then hop rows collapse) so the header and banner always fit.
 func TestRenderFrameShedsOnSmallHeight(t *testing.T) {
