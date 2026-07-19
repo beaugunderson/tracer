@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-isatty"
 
 	"tracer/internal/trace"
 	"tracer/internal/ui"
@@ -51,20 +52,31 @@ func main() {
 	defer cancel()
 
 	// Resolution blocks until it succeeds (it retries through a dropout), so show
-	// what's happening on the same line rather than leaving a blank screen.
+	// what's happening on the same line rather than leaving a blank screen. The
+	// in-place escapes only make sense on a terminal; piped/logged stderr gets
+	// plain lines instead of literal escape garbage.
+	tty := isatty.IsTerminal(os.Stderr.Fd())
 	onResolve := func(attempt int, prev error) {
 		if attempt == 1 {
-			fmt.Fprintf(os.Stderr, "tracer: resolving %s…", target)
+			if tty {
+				fmt.Fprintf(os.Stderr, "tracer: resolving %s…", target)
+			}
 			return
 		}
 		reason := "waiting for network"
 		if prev != nil {
 			reason = prev.Error()
 		}
-		fmt.Fprintf(os.Stderr, "\r\033[Ktracer: resolving %s… (attempt %d: %s)", target, attempt, reason)
+		if tty {
+			fmt.Fprintf(os.Stderr, "\r\033[Ktracer: resolving %s… (attempt %d: %s)", target, attempt, reason)
+		} else {
+			fmt.Fprintf(os.Stderr, "tracer: resolving %s… (attempt %d: %s)\n", target, attempt, reason)
+		}
 	}
 	sessions, err := trace.Start(ctx, target, opts, onResolve)
-	fmt.Fprint(os.Stderr, "\r\033[K") // clear the resolving line
+	if tty {
+		fmt.Fprint(os.Stderr, "\r\033[K") // clear the resolving line
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tracer: %v\n", err)
 		os.Exit(1)

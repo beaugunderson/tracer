@@ -25,17 +25,65 @@ type sample struct {
 	sentAt time.Time
 	rtt    time.Duration
 	state  SampleState
+	late   bool // credited after the timeout; excluded from the bar ceiling
 }
 
 // hop is one TTL position in the path. Addresses can change between probes
 // (load balancing), so the most recently seen one wins for display.
 type hop struct {
-	ttl     int
-	addr    net.IP
-	host    string          // reverse-DNS name, falls back to addr when empty
-	asn     string          // "AS<n> NAME" origin AS label, empty until resolved
-	addrs   map[string]bool // every address ever seen at this TTL
-	samples []*sample       // chronological ring, oldest first
+	ttl      int
+	addr     net.IP
+	host     string          // reverse-DNS name, falls back to addr when empty
+	asn      string          // origin-AS label, empty until resolved
+	hostDone bool            // reverse DNS resolved (or permanently unresolvable); retried while false
+	asnDone  bool            // ASN resolved (or permanently unresolvable); retried while false
+	addrs    map[string]bool // every address ever seen at this TTL
+	samples  []*sample       // chronological ring, oldest first
+
+	// Running aggregates over the hop's whole lifetime. The samples ring is
+	// capped, so it only backs the sparkline window; the cumulative stat columns
+	// come from these, updated as each probe is decided.
+	sent     int // decided probes (OK + Lost)
+	recv     int // OK probes
+	sumRTT   time.Duration
+	sumMs    float64 // running Σrtt and Σrtt² in ms, for jitter (stddev)
+	sumSqMs  float64
+	best     time.Duration
+	worst    time.Duration
+	last     time.Duration // RTT of the newest-sent OK probe
+	lastOKAt time.Time     // send time of the newest-sent OK probe
+}
+
+// noteLost counts a probe decided as lost.
+func (h *hop) noteLost() { h.sent++ }
+
+// noteOK counts a probe decided as received.
+func (h *hop) noteOK(rtt time.Duration, sentAt time.Time) {
+	h.sent++
+	h.creditOK(rtt, sentAt)
+}
+
+// creditOK folds a received probe's RTT into the aggregates without touching the
+// sent count — used directly when a probe already counted as lost is answered
+// late and flips back to OK.
+func (h *hop) creditOK(rtt time.Duration, sentAt time.Time) {
+	h.recv++
+	h.sumRTT += rtt
+	ms := float64(rtt) / float64(time.Millisecond)
+	h.sumMs += ms
+	h.sumSqMs += ms * ms
+	if h.recv == 1 || rtt < h.best {
+		h.best = rtt
+	}
+	if rtt > h.worst {
+		h.worst = rtt
+	}
+	// A late credit can be older than the newest reply; Last and SinceOK track
+	// the newest-sent OK probe only.
+	if sentAt.After(h.lastOKAt) {
+		h.lastOKAt = sentAt
+		h.last = rtt
+	}
 }
 
 const sampleCap = 4096
@@ -108,12 +156,16 @@ func (s *Session) getHop(ttl int) *hop {
 }
 
 // Reset clears all latency history and statistics while keeping the discovered
-// path, mirroring mtr's "restart statistics".
+// path and the outage log, mirroring mtr's "restart statistics".
 func (s *Session) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, h := range s.hops {
 		h.samples = nil
+		h.sent, h.recv = 0, 0
+		h.sumRTT, h.sumMs, h.sumSqMs = 0, 0, 0
+		h.best, h.worst, h.last = 0, 0, 0
+		h.lastOKAt = time.Time{}
 	}
 	s.pending = make(map[uint16]*pendingProbe)
 }
@@ -208,41 +260,19 @@ func (s *Session) Snapshot(maxSamples int) SessionView {
 			samples = samples[len(samples)-maxSamples:]
 		}
 
-		var sum time.Duration
-		var sumMs, sumSqMs float64 // for stddev (jitter)
-		var lastOKAt time.Time
-		first := true
-		for _, sm := range h.samples { // stats over full history, not the trimmed window
-			switch sm.state {
-			case OK:
-				hv.Sent++
-				hv.Recv++
-				hv.Last = sm.rtt
-				lastOKAt = sm.sentAt
-				sum += sm.rtt
-				ms := float64(sm.rtt) / float64(time.Millisecond)
-				sumMs += ms
-				sumSqMs += ms * ms
-				if first || sm.rtt < hv.Best {
-					hv.Best = sm.rtt
-				}
-				if sm.rtt > hv.Worst {
-					hv.Worst = sm.rtt
-				}
-				first = false
-			case Lost:
-				hv.Sent++
-			}
-		}
+		// Cumulative stats come from the hop's running aggregates, which cover the
+		// whole run — the samples ring is capped and only backs the sparkline.
+		hv.Sent, hv.Recv = h.sent, h.recv
+		hv.Last, hv.Best, hv.Worst = h.last, h.best, h.worst
 		if hv.Recv > 0 {
-			hv.Avg = sum / time.Duration(hv.Recv)
-			hv.SinceOK = time.Since(lastOKAt)
+			hv.Avg = h.sumRTT / time.Duration(hv.Recv)
+			hv.SinceOK = time.Since(h.lastOKAt)
 		} else {
 			hv.SinceOK = -1
 		}
 		if hv.Recv > 1 {
 			n := float64(hv.Recv)
-			if variance := sumSqMs/n - (sumMs/n)*(sumMs/n); variance > 0 {
+			if variance := h.sumSqMs/n - (h.sumMs/n)*(h.sumMs/n); variance > 0 {
 				hv.Jitter = time.Duration(math.Sqrt(variance) * float64(time.Millisecond))
 			}
 		}
@@ -268,7 +298,12 @@ func (s *Session) Snapshot(maxSamples int) SessionView {
 			hv.Samples[i] = SampleView{State: sm.state, RTT: sm.rtt, Round: sm.round}
 			// The height scale tracks only the visible window, so it recovers
 			// once an old spike scrolls off (stats columns keep full history).
-			if sm.state == OK && sm.rtt > view.MaxRTT {
+			// Late-credited replies are excluded: a hop whose control plane
+			// answers tens of seconds late (Starlink's PoP gateway does this
+			// continuously) would otherwise pin the ceiling and flatten every
+			// other row's bars. Its own row still shows them — full-height bars,
+			// and honest loss/avg/worst columns.
+			if sm.state == OK && !sm.late && sm.rtt > view.MaxRTT {
 				view.MaxRTT = sm.rtt
 			}
 		}
@@ -316,10 +351,10 @@ func (s *Session) destDownLocked(now time.Time) (bool, time.Time) {
 		return false, time.Time{} // no destination known yet — not an outage
 	}
 	h := s.hops[destTTL]
-	for i := len(h.samples) - 1; i >= 0; i-- {
-		if h.samples[i].state == OK {
-			return now.Sub(h.samples[i].sentAt) >= DownThreshold, h.samples[i].sentAt
-		}
+	if h.recv > 0 {
+		return now.Sub(h.lastOKAt) >= DownThreshold, h.lastOKAt
 	}
-	return true, time.Time{} // reached it before, but no reply remains in the ring
+	// No reply on record. Probes decided as lost are evidence of an outage; an
+	// empty record (e.g. right after a stats reset) is unknown, not an outage.
+	return h.sent > 0, time.Time{}
 }

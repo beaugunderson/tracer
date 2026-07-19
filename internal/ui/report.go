@@ -10,14 +10,19 @@ import (
 )
 
 // Report renders a plain-text (no ANSI, no alt-screen) snapshot of the sessions,
-// suitable for piping or logging. The sparkline is monochrome braille.
+// suitable for piping or logging. The sparkline is monochrome braille with ×
+// marking loss.
 func Report(sessions []*trace.Session) string {
 	const sparkW = 40
 	views := make([]trace.SessionView, len(sessions))
 	for i, s := range sessions {
 		views[i] = s.Snapshot(sparkW * 2)
 	}
+	return renderReport(views, time.Now())
+}
 
+// renderReport is the pure renderer behind Report, split out for tests.
+func renderReport(views []trace.SessionView, now time.Time) string {
 	showASN := false
 	for _, v := range views {
 		for _, h := range v.Hops {
@@ -64,10 +69,23 @@ func Report(sessions []*trace.Session) string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("⣀ low → ⣿ high (per family)   ⣿ = loss\n")
+	if rows, hints, _ := outageTable(views, now, 0); len(rows) > 0 {
+		b.WriteString("recent outages")
+		if len(hints) > 0 {
+			b.WriteString("   " + strings.Join(hints, " · "))
+		}
+		durW := durWidth(rows)
+		for _, r := range rows {
+			fmt.Fprintf(&b, "\n  %-3s %*s   %s", r.fam, durW, r.dur, r.when)
+		}
+		b.WriteString("\n\n")
+	}
+	b.WriteString("⣀ low → ⣿ high (per family)   " + string(lossRune) + " = loss\n")
 	return b.String()
 }
 
+// plainSpark renders monochrome braille; loss cells become × since there is no
+// red to set them apart from a full-height bar.
 func plainSpark(samples []trace.SampleView, ceiling time.Duration) string {
 	points := make([]sparkline.Point, len(samples))
 	for i, s := range samples {
@@ -78,7 +96,16 @@ func plainSpark(samples []trace.SampleView, ceiling time.Duration) string {
 			points[i] = sparkline.Point{Filled: true, Loss: true}
 		}
 	}
-	return sparkline.String(sparkline.Cells(points))
+	cells := sparkline.Cells(points)
+	out := make([]rune, len(cells))
+	for i, c := range cells {
+		if c.Loss {
+			out[i] = lossRune
+		} else {
+			out[i] = c.R
+		}
+	}
+	return string(out)
 }
 
 func dur(d time.Duration) string {

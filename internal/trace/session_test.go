@@ -7,12 +7,9 @@ import (
 )
 
 func addSamples(h *hop, startRound, n int) {
+	base := time.Now().Add(-time.Duration(n) * time.Millisecond)
 	for i := 0; i < n; i++ {
-		r := startRound + i
-		h.samples = append(h.samples, &sample{state: OK, round: r, rtt: time.Millisecond})
-		if len(h.samples) > sampleCap {
-			h.samples = h.samples[len(h.samples)-sampleCap:]
-		}
+		addOK(h, startRound+i, time.Millisecond, base.Add(time.Duration(i)*time.Millisecond))
 	}
 }
 
@@ -54,9 +51,9 @@ func TestMaxRTTTracksVisibleWindow(t *testing.T) {
 	s := newSession("IPv4", "x", net.IPv4(1, 2, 3, 4), 30)
 	h := s.getHop(1)
 	// One giant spike, then many small samples that push it out of the window.
-	h.samples = append(h.samples, &sample{state: OK, round: 1, rtt: 2 * time.Second})
+	addOK(h, 1, 2*time.Second, time.Now())
 	for i := 0; i < 50; i++ {
-		h.samples = append(h.samples, &sample{state: OK, round: 2 + i, rtt: 40 * time.Millisecond})
+		addOK(h, 2+i, 40*time.Millisecond, time.Now())
 	}
 
 	if got := s.Snapshot(10).MaxRTT; got > 100*time.Millisecond {

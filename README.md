@@ -28,7 +28,8 @@ scale 0–102ms   ⣀ low → ⣿ high   ⣿ = packet loss   q quit · r reset s
   so a row shows twice as many samples as columns. Bar height is the latency on a
   **single global scale** (the worst hop sets the ceiling), so you can read *where*
   latency enters the path at a glance — no legend to memorize. Lost probes render
-  as full-height bars in red. Like mtr, history is right-aligned with the newest
+  as full-height bars in red (as `×` in `-mono` and `-report`, where there's no
+  red to set them apart). Like mtr, history is right-aligned with the newest
   ping pinned to the right edge; probes are paced across the interval so each row's
   newest column fills in live as its reply lands.
 - **Two scales at once.** Bar *height* uses a per-family scale (that family's worst
@@ -50,17 +51,26 @@ scale 0–102ms   ⣀ low → ⣿ high   ⣿ = packet loss   q quit · r reset s
   first sign a call's about to get choppy, before any loss — and each family header
   shows its destination availability (`98.7% up`).
 - **Outage log.** Recent destination-unreachable episodes are listed below the
-  chart (family, duration, time-ago). When a family's outages recur regularly
-  (Starlink's satellite cadence often does), it notes the period: `v6 ≈ every 15s`.
+  chart (family, duration, time-ago) and in the `-report` output. When a family's
+  outages recur regularly (Starlink's satellite cadence often does), it notes the
+  period: `v6 ≈ every 15s`.
 - **Survives outages.** Built to be left running through dropouts: a transient
-  network error never kills the receiver, and startup DNS retries through a gap, so
-  it keeps monitoring and recovers on its own when the link returns.
+  network error never kills the receiver, startup DNS retries through a gap, and
+  hop hostname/AS lookups that fail while DNS is down retry on their own, so it
+  keeps monitoring and recovers on its own when the link returns. A reply that
+  straggles in after the timeout (within 60s) is credited back, repairing the
+  loss stats — which exposes routers whose control plane answers tens of seconds
+  late (Starlink's PoP gateway does this) as a huge avg on an otherwise healthy
+  path. Late-credited replies don't inflate the bar scale, so such a hop can't
+  flatten the rest of the chart.
 - **Dual-stack at once.** When a host resolves to both A and AAAA records, tracer
   runs two independent traceroutes — IPv4 on top, IPv6 below — so path-dependent
   problems (one family slow or broken) are immediately visible.
 - **No sudo required.** By default tracer uses unprivileged datagram ICMP sockets
-  (the same mechanism `ping` uses). Pass `-r` to use raw sockets where datagram
-  ICMP isn't permitted (some Linux configs); that mode needs root.
+  (the same mechanism `ping` uses). On Linux these are gated by a sysctl — make
+  sure your gid is inside `net.ipv4.ping_group_range` (many distros ship it as
+  `1 0`, i.e. nobody). Pass `-r` to use raw sockets where datagram ICMP isn't
+  permitted; that mode needs root.
 
 ## Usage
 

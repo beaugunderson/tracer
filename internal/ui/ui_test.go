@@ -43,7 +43,7 @@ func testViews() []trace.SessionView {
 
 func TestRenderFrameContainsHopsAndBraille(t *testing.T) {
 	now := time.Date(2026, 6, 25, 22, 47, 30, 0, time.UTC)
-	out := renderFrame(testViews(), 120, "kaiton.local", 40, now, true, false)
+	out := renderFrame(testViews(), 120, 0, "kaiton.local", 40, now, true, false)
 
 	for _, want := range []string{"tracer", "IPv4 → google.com (142.250.72.46)", "gateway", "dns.google", "bars 0–72.0ms"} {
 		if !strings.Contains(out, want) {
@@ -66,7 +66,7 @@ func TestSilentHopsCollapse(t *testing.T) {
 		},
 	}}
 	now := time.Date(2026, 6, 25, 22, 47, 30, 0, time.UTC)
-	out := renderFrame(views, 120, "h", 40, now, true, false)
+	out := renderFrame(views, 120, 0, "h", 40, now, true, false)
 
 	if !strings.Contains(out, "2-3 (no reply)") {
 		t.Errorf("consecutive silent hops not collapsed into a range; got:\n%s", out)
@@ -128,7 +128,7 @@ func TestConnectivityBanner(t *testing.T) {
 func TestRenderFrameRowWidthBounded(t *testing.T) {
 	now := time.Date(2026, 6, 25, 22, 47, 30, 0, time.UTC)
 	const width = 100
-	out := renderFrame(testViews(), width, "kaiton.local", 40, now, true, false)
+	out := renderFrame(testViews(), width, 0, "kaiton.local", 40, now, true, false)
 	for _, line := range strings.Split(out, "\n") {
 		if w := visibleWidth(line); w > width {
 			t.Errorf("line exceeds width %d (got %d): %q", width, w, line)
@@ -204,3 +204,100 @@ func stripANSI(s string) string {
 }
 
 var ansiSGR = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func TestShortDurHours(t *testing.T) {
+	cases := map[time.Duration]string{
+		42 * time.Second:                "42s",
+		19*time.Minute + 50*time.Second: "19m50s",
+		2 * time.Hour:                   "2h00m",
+		3*time.Hour + 5*time.Minute:     "3h05m",
+	}
+	for in, want := range cases {
+		if got := shortDur(in); got != want {
+			t.Errorf("shortDur(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestMonoLossGlyph: without color, loss must not render as the same full bar as
+// ceiling-height latency — it becomes ×. With color it stays the red ⣿.
+func TestMonoLossGlyph(t *testing.T) {
+	samples := sampleSeq(5, -1, 5, -1) // alternate OK and lost
+	ceiling := 5 * time.Millisecond
+
+	mono := renderSpark(samples, ceiling, 4, 4, false)
+	if !strings.ContainsRune(mono, lossRune) {
+		t.Errorf("mono sparkline should mark loss with %q, got %q", lossRune, mono)
+	}
+	colored := stripANSI(renderSpark(samples, ceiling, 4, 4, true))
+	if strings.ContainsRune(colored, lossRune) {
+		t.Errorf("color sparkline should keep braille loss cells, got %q", colored)
+	}
+}
+
+// TestRenderFrameShedsOnSmallHeight: extras shed in order (outages, then the
+// footer legend, then hop rows collapse) so the header and banner always fit.
+func TestRenderFrameShedsOnSmallHeight(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	views := testViews()
+	views[0].Outages = []trace.Outage{
+		{Start: now.Add(-2 * time.Minute), End: now.Add(-time.Minute)},
+	}
+
+	full := renderFrame(views, 120, 0, "h", 40, now, true, false)
+	if !strings.Contains(full, "recent outages") || !strings.Contains(full, "q quit") {
+		t.Fatalf("unclamped frame should include outages and footer:\n%s", full)
+	}
+	fullLines := lineCount(full)
+
+	// Barely too small: the outage list goes first, the footer survives.
+	noOutages := renderFrame(views, 120, fullLines-1, "h", 40, now, true, false)
+	if strings.Contains(noOutages, "recent outages") {
+		t.Errorf("outage list should shed first on a short viewport")
+	}
+	if !strings.Contains(noOutages, "q quit") {
+		t.Errorf("footer should survive while shedding the outage list")
+	}
+
+	// Smaller still: the footer goes too, hop rows collapse into a "…N more" line.
+	tiny := renderFrame(views, 120, 5, "h", 40, now, true, false)
+	if strings.Contains(tiny, "q quit") {
+		t.Errorf("footer should shed on a tiny viewport")
+	}
+	if lineCount(tiny) > 5 {
+		t.Errorf("clamped frame is %d lines, want <= 5:\n%s", lineCount(tiny), tiny)
+	}
+	if !strings.Contains(stripANSI(tiny), "more") {
+		t.Errorf("truncated frame should note the hidden rows:\n%s", tiny)
+	}
+	if !strings.Contains(tiny, "tracer") {
+		t.Errorf("title must always survive clamping")
+	}
+}
+
+// TestReportIncludesOutages: the headless report must carry the outage log — the
+// main reason to leave tracer running overnight.
+func TestReportIncludesOutages(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	views := testViews()
+	views[0].Outages = []trace.Outage{
+		{Start: now.Add(-30 * time.Minute), End: now.Add(-30*time.Minute + 22*time.Second)},
+	}
+
+	out := renderReport(views, now)
+	if !strings.Contains(out, "recent outages") {
+		t.Fatalf("report missing the outage section:\n%s", out)
+	}
+	if !strings.Contains(out, "× = loss") {
+		t.Errorf("report legend should use the × loss glyph:\n%s", out)
+	}
+}
+
+// TestReportLossUsesLossRune: lost probes in the plain report sparkline render
+// as ×, never as a bar.
+func TestReportLossUsesLossRune(t *testing.T) {
+	out := plainSpark(sampleSeq(-1, -1), time.Millisecond)
+	if out != string(lossRune) {
+		t.Errorf("plainSpark loss = %q, want %q", out, string(lossRune))
+	}
+}

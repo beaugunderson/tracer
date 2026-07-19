@@ -11,10 +11,11 @@ import (
 )
 
 // quotedV4Echo builds the packet an ICMP error quotes back: a 20-byte IPv4
-// header followed by the first 8 bytes of our echo (carrying id + seq).
+// header followed by the first 8 bytes of our echo request (carrying id + seq).
 func quotedV4Echo(id, seq uint16) []byte {
 	data := make([]byte, 28)
 	data[0] = 0x45 // IPv4, IHL=5 → 20-byte header
+	data[20] = 8   // inner ICMP type: echo request
 	binary.BigEndian.PutUint16(data[24:26], id)
 	binary.BigEndian.PutUint16(data[26:28], seq)
 	return data
@@ -87,11 +88,21 @@ func TestPathLengthTracksAddresses(t *testing.T) {
 	}
 }
 
+// addOK appends a received sample and updates the hop's running aggregates,
+// mirroring what recordReply does in production.
+func addOK(h *hop, round int, rtt time.Duration, sentAt time.Time) {
+	h.samples = append(h.samples, &sample{state: OK, round: round, rtt: rtt, sentAt: sentAt})
+	if len(h.samples) > sampleCap {
+		h.samples = h.samples[len(h.samples)-sampleCap:]
+	}
+	h.noteOK(rtt, sentAt)
+}
+
 func TestJitterIsStdDev(t *testing.T) {
 	s := newSession("IPv4", "x", net.IPv4(8, 8, 8, 8), 30)
 	h := s.getHop(1)
 	for i, ms := range []int{10, 20, 30, 40, 50} {
-		h.samples = append(h.samples, &sample{state: OK, round: i + 1, rtt: time.Duration(ms) * time.Millisecond})
+		addOK(h, i+1, time.Duration(ms)*time.Millisecond, time.Now())
 	}
 	// mean 30ms, population stddev = sqrt(200) ≈ 14.14ms.
 	got := s.Snapshot(10).Hops[0].Jitter
@@ -105,8 +116,9 @@ func TestRecentSmoothsLastPings(t *testing.T) {
 	s := newSession("IPv4", "x", net.IPv4(8, 8, 8, 8), 30)
 	h := s.getHop(1)
 	// Steady 20ms with a single 80ms spike as the newest reply.
+	base := time.Now()
 	for i, ms := range []int{20, 20, 20, 20, 20, 80} {
-		h.samples = append(h.samples, &sample{state: OK, round: i + 1, rtt: time.Duration(ms) * time.Millisecond})
+		addOK(h, i+1, time.Duration(ms)*time.Millisecond, base.Add(time.Duration(i)*time.Second))
 	}
 	hv := s.Snapshot(10).Hops[0]
 	if hv.Last != 80*time.Millisecond {
@@ -126,14 +138,14 @@ func TestOutageTracking(t *testing.T) {
 
 	now := time.Now()
 	// Last reply was 3s ago → past the down threshold → an outage opens.
-	h.samples = append(h.samples, &sample{state: OK, rtt: time.Millisecond, sentAt: now.Add(-3 * time.Second)})
+	addOK(h, 1, time.Millisecond, now.Add(-3*time.Second))
 	s.updateOutagesLocked(now)
 	if len(s.outages) != 1 || !s.outageOpen {
 		t.Fatalf("expected one open outage, got %d open=%v", len(s.outages), s.outageOpen)
 	}
 
 	// A fresh reply → the outage closes.
-	h.samples = append(h.samples, &sample{state: OK, rtt: time.Millisecond, sentAt: now})
+	addOK(h, 2, time.Millisecond, now)
 	s.updateOutagesLocked(now)
 	if s.outageOpen || s.outages[0].End.IsZero() {
 		t.Fatalf("expected outage closed with an End set, open=%v end=%v", s.outageOpen, s.outages[0].End)

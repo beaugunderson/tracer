@@ -7,10 +7,17 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
 
 - `main.go` — flags, target, root check (only for `-r`), launches TUI or `-report`.
 - `internal/trace/` — the traceroute engine and shared state.
-  - `session.go` — `Session` (per address family), per-hop sample ring buffers,
+  - `session.go` — `Session` (per address family), per-hop sample ring buffers
+    plus per-hop **running aggregates** (sent/recv/sum/sumSq/best/worst/last/
+    lastOKAt, updated via `noteOK`/`noteLost`/`creditOK` as each probe is
+    decided). The ring (`sampleCap` 4096) only backs the sparkline window; every
+    cumulative stat column comes from the aggregates, so nothing degrades into a
+    rolling window on long runs and `Snapshot` never scans full history.
     `Snapshot(maxSamples)` returns the exported read-only `SessionView`/`HopView`
-    used by the UI; `Reset()` clears stats.
-  - `engine.go` — sockets, probe send loop, receive loop, loss sweeper, reverse DNS.
+    used by the UI; `Reset()` clears samples + aggregates but keeps the
+    discovered path AND the outage log.
+  - `engine.go` — sockets, probe send loop, receive loop, loss sweeper, reverse
+    DNS + ASN resolution (with a 30s retry loop for hops still unresolved).
 - `internal/sparkline/` — braille rendering. `Cells([]Point) []Cell`; one glyph = 2
   samples, bars 0–4 dots filled from the bottom. Loss = full bar, `Cell.Loss` set.
 - `internal/ui/` — bubbletea `Model` + pure `renderFrame(...)` (testable without a
@@ -23,14 +30,18 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
   enters that path without a slow family flattening a fast one. The ceiling
   (`SessionView.MaxRTT`) is computed over only the **visible window**, not full
   history, so it recovers once an old spike scrolls off; the avg/best/worst stat
-  columns stay cumulative.
+  columns stay cumulative (they read the hop's running aggregates, not the
+  capped ring).
 - Glyph **color** is an independent per-row gradient over that hop's own min→max
   (`colorIndexFor`, `gradientPalette`), so a globally-flat hop still shows its
   jitter. The ramp is cool→warm and deliberately avoids red; **red is reserved for
   loss**. A glyph holds two pings but a cell has one color, so it's colored by the
   worse of the two. `colorFloor` keeps sub-ms jitter from filling the whole ramp.
-  Toggle with `-mono` (`ui.New(sessions, color)`). `renderRuns` applies one style
-  per run of equal-colored glyphs to keep ANSI escapes down.
+  Toggle with `-mono` (`ui.New(sessions, color, asn)`). `renderRuns` applies one
+  style per run of equal-colored glyphs to keep ANSI escapes down.
+- When color is off (`-mono`, `-report`), a loss cell renders as `×` (`lossRune`)
+  instead of the braille full bar — without red, `⣿` would be indistinguishable
+  from ceiling-height latency. Color mode keeps the red `⣿`.
 
 ## Engine specifics
 
@@ -44,6 +55,22 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
   local UDP port; raw mode uses the pid.
 - Probes match replies by sequence number via the `pending` map. `hop.samples` is
   `[]*sample` (pointers) so trimming the ring never invalidates pending references.
+- The sweeper (`sweep`, called by `sweepLoop` every 200ms) decides probes in two
+  phases: past `Timeout` a probe is marked `Lost` (so loss shows promptly) but
+  **stays in `pending`**; past `lateGrace` (60s, or 2×Timeout if larger) it's
+  pruned. A reply inside the grace flips the sample back to `OK` via
+  `hop.creditOK` — recv/avg/best/worst/loss% self-repair; `Last`/`SinceOK` only
+  move if the credited probe is the newest-sent OK. The grace must stay well
+  under the ~18-minute uint16 seq-wrap horizon. Credited samples are flagged
+  `late` and excluded from the family bar ceiling (`MaxRTT`): a hop whose
+  control plane answers ~30s late *continuously* (Starlink's PoP gateway) would
+  otherwise pin the ceiling and flatten every other row. Its own row still
+  shows them (full-height bars, honest loss/avg/worst).
+- `extractEcho` also checks the quoted inner packet's ICMP type byte (echo
+  request: 8 v4 / 128 v6), so quoted traffic from another program colliding on
+  id can't match.
+- `-4`/`-6` apply to literal IPs too; a family flag contradicting a literal is a
+  `permanentError`, which `resolveRetry` fails fast on instead of retrying.
 - `sendLoop` probes the whole TTL range (`1..maxHops`) **every** cycle, paced
   `interval/maxHops` apart — never clamped. So the whole path appears within ~one
   round-trip AND the path tracks route changes live (grows/shrinks/reroutes). The
@@ -91,6 +118,12 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
   (`routableForASN`). The label is the name only (number is dropped; falls back to
   `AS<n>` only when unnamed); `asnRename` shortens known handles (SPACEX-STARLINK →
   STARLINK). The UI shows a dim 8-wide `colASN` column (ellipsized) when `-z` is set.
+- Reverse-DNS and ASN lookups distinguish **settled** from transient outcomes:
+  a hop keeps `hostDone`/`asnDone` false after a timeout/servfail (DNS down
+  mid-dropout) and `resolveLoop` re-kicks those every 30s until they settle; a
+  bogus PTR, NXDOMAIN, or non-routable address settles immediately. `asnName`
+  never caches a failed lookup, so a transient miss can't pin an empty name for
+  the whole run. An address change resets both flags.
 
 ## Resilience (built for leaving running through Starlink dropouts)
 
@@ -110,9 +143,20 @@ simultaneous IPv4 + IPv6 paths. Single binary, bubbletea TUI.
   per-probe timeout. ONLINE if any family is reachable (Zoom works on either).
 - Outages are tracked engine-side in `sweepLoop` via `updateOutagesLocked` (keyed on
   the same `DownThreshold` as the banner), stored per `Session` and exposed as
-  `SessionView.Outages`. `renderOutages` lists recent episodes below the chart and
-  annotates a family with `≈ every Ns` only when `periodicity()` finds the onset
-  intervals regular (≥4 outages, coefficient of variation < 0.4) — never guesses.
+  `SessionView.Outages`. `renderOutages` lists recent episodes below the chart
+  (and `renderReport` in `-report` output — both share `outageTable`), annotating
+  a family with `≈ every Ns` only when `periodicity()` finds the onset intervals
+  regular (≥4 outages, coefficient of variation < 0.4) — never guesses.
+  `shortDur` has an hours tier (`3h05m`) for overnight runs.
+- `destDownLocked` reads the dest hop's aggregates: replies on record → compare
+  `lastOKAt` against `DownThreshold`; only lost probes on record → down; nothing
+  decided at all → **unknown, not down**. That last case is what keeps `Reset()`
+  (which empties the aggregates but keeps hop addresses and the outage log) from
+  fabricating a phantom outage in the ~interval before the next reply lands.
+- `renderFrame` takes the viewport height and sheds when the frame is too tall:
+  outage list first, then the footer legend, then hop rows collapse into a dim
+  `…N more` line — the title and connectivity banner always survive. height ≤ 0
+  (tests) disables the clamp; `View` still pads short frames.
 - Jitter is RTT stddev over a hop's received probes (`HopView.Jitter`, computed in
   `Snapshot`); availability in each family header is `100 - destHop.LossPct`.
 - The TUI latency column and the banner show `HopView.Recent` — the mean of the

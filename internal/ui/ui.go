@@ -56,6 +56,10 @@ const (
 	keyLoss  = -1
 )
 
+// lossRune replaces the loss glyph when color is off (-mono, -report): without
+// red, a full ⣿ bar would be indistinguishable from ceiling-height latency.
+const lossRune = '×'
+
 // downThreshold is how long without a reply from the destination before a family
 // is called OFFLINE. Shared with the engine's outage tracking.
 const downThreshold = trace.DownThreshold
@@ -123,7 +127,7 @@ func (m Model) View() string {
 	for i, s := range m.sessions {
 		views[i] = s.Snapshot(maxSamples)
 	}
-	frame := renderFrame(views, m.width, m.hostname, maxSamples, time.Now(), m.color, m.asn)
+	frame := renderFrame(views, m.width, m.height, m.hostname, maxSamples, time.Now(), m.color, m.asn)
 
 	// Pad to the viewport height so a frame that shrank (a hop collapsing, the
 	// path clamping) overwrites the taller previous frame's trailing lines
@@ -148,14 +152,14 @@ func sparkWidth(width int, asn bool) int {
 
 // renderFrame is the pure TUI renderer: given snapshots it produces the full
 // screen string. Kept free of Model/clock state so it can be tested directly.
-func renderFrame(views []trace.SessionView, width int, hostname string, samples int, now time.Time, color, asn bool) string {
+// When the frame is taller than height (>0), extras shed in order — the outage
+// list first, then the footer legend, then hop rows collapse into a "…N more"
+// line — so the header and banner always stay visible. height <= 0 disables
+// the clamp.
+func renderFrame(views []trace.SessionView, width, height int, hostname string, samples int, now time.Time, color, asn bool) string {
 	sparkW := sparkWidth(width, asn)
 
-	var b strings.Builder
-	b.WriteString(renderTitle(width, hostname, samples, now))
-	b.WriteString("\n")
-	b.WriteString(renderStatus(views))
-	b.WriteString("\n\n")
+	var sess strings.Builder
 	for i := range views {
 		// Each family scales its bars to its own worst hop (over the visible
 		// window), so a slow family doesn't flatten a fast one and vice versa.
@@ -163,31 +167,65 @@ func renderFrame(views []trace.SessionView, width int, hostname string, samples 
 		if ceiling <= 0 {
 			ceiling = time.Millisecond
 		}
-		b.WriteString(renderSession(views[i], ceiling, sparkW, color, asn))
+		sess.WriteString(renderSession(views[i], ceiling, sparkW, color, asn))
 		if i != len(views)-1 {
-			b.WriteString("\n")
+			sess.WriteString("\n")
 		}
 	}
-	b.WriteString("\n")
-	if og := renderOutages(views, now); og != "" {
-		b.WriteString(og)
-		b.WriteString("\n\n") // blank line between the outage list and the legend
+	outages := renderOutages(views, now)
+	footer := renderFooter(color, width)
+
+	assemble := func(withOutages, withFooter bool) string {
+		var b strings.Builder
+		b.WriteString(renderTitle(width, hostname, samples, now))
+		b.WriteString("\n")
+		b.WriteString(renderStatus(views))
+		b.WriteString("\n\n")
+		b.WriteString(sess.String())
+		b.WriteString("\n")
+		if withOutages && outages != "" {
+			b.WriteString(outages)
+			b.WriteString("\n\n") // blank line between the outage list and the legend
+		}
+		if withFooter {
+			b.WriteString(footer)
+		}
+		return strings.TrimRight(b.String(), "\n")
 	}
-	b.WriteString(renderFooter(color, width))
-	return b.String()
+
+	frame := assemble(true, true)
+	if height > 0 && lineCount(frame) > height {
+		frame = assemble(false, true)
+	}
+	if height > 0 && lineCount(frame) > height {
+		frame = assemble(false, false)
+	}
+	if height > 0 && lineCount(frame) > height {
+		lines := strings.Split(frame, "\n")
+		keep := height - 1
+		if keep < 1 {
+			keep = 1
+		}
+		frame = strings.Join(lines[:keep], "\n") + "\n" +
+			dimStyle.Render(fmt.Sprintf("…%d more", len(lines)-keep))
+	}
+	return frame
 }
 
-type outageEntry struct {
-	family string
-	o      trace.Outage
-}
+func lineCount(s string) int { return strings.Count(s, "\n") + 1 }
 
-// renderOutages lists recent destination-unreachable episodes (most recent first)
-// and, when a family's outages recur at a regular interval, notes the period.
-func renderOutages(views []trace.SessionView, now time.Time) string {
+type outageRow struct{ fam, dur, when string }
+
+// outageTable flattens the per-family outage lists into display rows (most
+// recent first), the per-family periodicity hints, and how many rows were cut
+// by max (<= 0 shows all). Shared by the TUI outage list and -report.
+func outageTable(views []trace.SessionView, now time.Time, max int) (rows []outageRow, hints []string, extra int) {
+	type outageEntry struct {
+		family string
+		o      trace.Outage
+	}
 	var entries []outageEntry
-	periods := map[string]time.Duration{}
-	for _, v := range views {
+	for _, v := range views { // stable family order, so hints stay ordered too
 		fam := shortFamily(v.Family)
 		var starts []time.Time
 		for _, o := range v.Outages {
@@ -195,57 +233,59 @@ func renderOutages(views []trace.SessionView, now time.Time) string {
 			starts = append(starts, o.Start)
 		}
 		if p, ok := periodicity(starts); ok {
-			periods[fam] = p
+			hints = append(hints, fmt.Sprintf("%s ≈ every %s", fam, shortDur(p)))
 		}
-	}
-	if len(entries) == 0 {
-		return ""
 	}
 	// Most recent first (ongoing outages sort to the top via their start time).
 	sort.Slice(entries, func(i, j int) bool { return entries[i].o.Start.After(entries[j].o.Start) })
-
-	head := titleStyle.Render("recent outages")
-	if len(periods) > 0 {
-		var hints []string
-		for _, v := range views { // stable family order
-			fam := shortFamily(v.Family)
-			if p, ok := periods[fam]; ok {
-				hints = append(hints, fmt.Sprintf("%s ≈ every %s", fam, shortDur(p)))
-			}
-		}
-		head += dimStyle.Render("   " + strings.Join(hints, " · "))
+	if max > 0 && len(entries) > max {
+		extra = len(entries) - max
+		entries = entries[:max]
 	}
-
-	const maxShown = 6
-	shown := entries
-	if len(shown) > maxShown {
-		shown = shown[:maxShown]
-	}
-
-	// Size the duration column to the widest value shown so a long outage
-	// (e.g. "19m50s") doesn't shove the "ago" column out of alignment.
-	type row struct{ fam, dur, when string }
-	rows := make([]row, len(shown))
-	durW := 0
-	for i, e := range shown {
-		dur := shortDur(e.o.Duration(now))
+	for _, e := range entries {
 		when := shortDur(now.Sub(e.o.End)) + " ago"
 		if e.o.Ongoing() {
 			when = "ongoing"
 		}
-		rows[i] = row{e.family, dur, when}
-		if len(dur) > durW {
-			durW = len(dur)
+		rows = append(rows, outageRow{e.family, shortDur(e.o.Duration(now)), when})
+	}
+	return rows, hints, extra
+}
+
+// durWidth sizes the duration column to the widest value shown so a long outage
+// (e.g. "19m50s") doesn't shove the "ago" column out of alignment.
+func durWidth(rows []outageRow) int {
+	w := 0
+	for _, r := range rows {
+		if len(r.dur) > w {
+			w = len(r.dur)
 		}
+	}
+	return w
+}
+
+// renderOutages lists recent destination-unreachable episodes (most recent first)
+// and, when a family's outages recur at a regular interval, notes the period.
+func renderOutages(views []trace.SessionView, now time.Time) string {
+	const maxShown = 6
+	rows, hints, extra := outageTable(views, now, maxShown)
+	if len(rows) == 0 {
+		return ""
+	}
+
+	head := titleStyle.Render("recent outages")
+	if len(hints) > 0 {
+		head += dimStyle.Render("   " + strings.Join(hints, " · "))
 	}
 
 	var b strings.Builder
 	b.WriteString(head)
+	durW := durWidth(rows)
 	for _, r := range rows {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  %-3s %*s   %s", r.fam, durW, r.dur, r.when)))
 	}
-	if len(entries) > maxShown {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  …and %d more", len(entries)-maxShown)))
+	if extra > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  …and %d more", extra)))
 	}
 	return b.String()
 }
@@ -410,10 +450,14 @@ func shortDur(d time.Duration) string {
 		d = 0
 	}
 	s := int(d.Round(time.Second) / time.Second)
-	if s < 60 {
+	switch {
+	case s < 60:
 		return fmt.Sprintf("%ds", s)
+	case s < 3600:
+		return fmt.Sprintf("%dm%02ds", s/60, s%60)
+	default:
+		return fmt.Sprintf("%dh%02dm", s/3600, s%3600/60)
 	}
-	return fmt.Sprintf("%dm%02ds", s/60, s%60)
 }
 
 func renderSession(v trace.SessionView, ceiling time.Duration, sparkW int, color, asn bool) string {
@@ -477,11 +521,12 @@ func renderSilent(start, end int) string {
 func renderHop(h trace.HopView, ceiling time.Duration, sparkW, maxRound int, color, asn bool) string {
 	idx := fmt.Sprintf("%2d.", h.TTL)
 
-	host := h.Host
-	if host == "" {
-		host = waitStyle.Render("(waiting for reply)")
+	// Truncate before styling: truncate slices runes and would corrupt a string
+	// that already carries ANSI escapes.
+	host := truncate(h.Host, colHost)
+	if h.Host == "" {
+		host = waitStyle.Render(truncate("(waiting for reply)", colHost))
 	}
-	host = truncate(host, colHost)
 	hostCell := host + strings.Repeat(" ", max0(colHost-lipgloss.Width(host)))
 
 	loss := fmt.Sprintf("%4.0f%%", h.LossPct)
@@ -544,16 +589,20 @@ func renderSpark(samples []trace.SampleView, ceiling time.Duration, sparkW, maxR
 		}
 		cell := sparkline.Glyph(points[2*g], points[2*g+1]) // even round left, odd right
 		key := keyPlain
+		r := cell.R
 		switch {
 		case cell.Loss:
 			key = keyLoss
+			if !color {
+				r = lossRune // no red available to set loss apart from a full bar
+			}
 		case color && have:
 			// Color the glyph by the worse of its two pings, on this row's scale.
 			if w := maxDur(rtts[2*g], rtts[2*g+1]); w > 0 {
 				key = colorIndexFor(w, rowMin, rowMax)
 			}
 		}
-		runes = append(runes, cell.R)
+		runes = append(runes, r)
 		keys = append(keys, key)
 	}
 	return renderRuns(runes, keys)
@@ -618,7 +667,11 @@ func pointFor(s trace.SampleView, ceiling time.Duration) sparkline.Point {
 
 func renderFooter(color bool, width int) string {
 	bars := titleStyle.Render("bars") + " " + dimStyle.Render("⣀ low → ⣿ high (per family)")
-	loss := lossStyle.Render("⣿ = loss")
+	lossGlyph := "⣿"
+	if !color {
+		lossGlyph = string(lossRune)
+	}
+	loss := lossStyle.Render(lossGlyph + " = loss")
 	keys := dimStyle.Render("q quit · r reset stats")
 	essential := fmt.Sprintf("%s   %s   %s", bars, loss, keys)
 

@@ -3,6 +3,7 @@ package trace
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +20,18 @@ const (
 	protoICMP4 = 1
 	protoICMP6 = 58
 )
+
+// lateGrace is how long after being sent a probe can still be credited by a
+// straggling reply: the sweeper marks it Lost at the timeout (so the UI shows
+// the loss promptly) but keeps it matchable, and a reply inside the grace flips
+// it back to OK and repairs the stats. Kept well under the ~18-minute uint16
+// sequence-wrap horizon.
+const lateGrace = 60 * time.Second
+
+// resolveRetryInterval is how often hops with an unresolved hostname or ASN get
+// their lookups re-kicked — a lookup that failed transiently (e.g. DNS still
+// down as a dropout recovers) would otherwise leave the hop unlabeled forever.
+const resolveRetryInterval = 30 * time.Second
 
 // Options configures a traceroute run.
 type Options struct {
@@ -113,6 +126,10 @@ func resolveRetry(ctx context.Context, target string, opts Options, onResolve fu
 		if err == nil {
 			return ip4, ip6, nil
 		}
+		var pe permanentError
+		if errors.As(err, &pe) {
+			return nil, nil, err // retrying can never fix this — fail fast
+		}
 		select {
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
@@ -121,10 +138,23 @@ func resolveRetry(ctx context.Context, target string, opts Options, onResolve fu
 	}
 }
 
+// permanentError marks a resolution failure that retrying can never fix (e.g. a
+// family flag contradicting a literal IP); resolveRetry fails fast on it.
+type permanentError struct{ err error }
+
+func (p permanentError) Error() string { return p.err.Error() }
+func (p permanentError) Unwrap() error { return p.err }
+
 func resolve(ctx context.Context, target string, opts Options) (ip4, ip6 net.IP, err error) {
 	if ip := net.ParseIP(target); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
+			if opts.Force6 {
+				return nil, nil, permanentError{fmt.Errorf("-6 was given but %q is an IPv4 address", target)}
+			}
 			return v4, nil, nil
+		}
+		if opts.Force4 {
+			return nil, nil, permanentError{fmt.Errorf("-4 was given but %q is an IPv6 address", target)}
 		}
 		return nil, ip, nil
 	}
@@ -193,14 +223,16 @@ func startEngine(ctx context.Context, s *Session, opts Options) error {
 	go e.recvLoop(ctx)
 	go e.sendLoop(ctx)
 	go e.sweepLoop(ctx)
+	go e.resolveLoop(ctx)
 	return nil
 }
 
-// sendLoop probes one hop at a time, spacing a full cycle (TTL 1..ceiling)
+// sendLoop probes one hop at a time, spacing a full cycle (TTL 1..maxHops)
 // evenly across the interval. Pacing the probes — rather than bursting them all
 // at once — means each row's reply lands at a different moment, so rows update
 // live as results arrive instead of all flipping together once per round. The
-// ceiling is the whole TTL range until the target answers, then clamps to it.
+// ceiling is always the whole TTL range — never clamped to the destination —
+// so the path tracks route changes live (Snapshot hides hops past the target).
 func (e *engine) sendLoop(ctx context.Context) {
 	defer e.conn.Close()
 
@@ -335,22 +367,30 @@ func (e *engine) handle(m *icmp.Message, peer net.Addr) {
 }
 
 // extractEcho pulls the original ICMP id and sequence out of the packet quoted
-// inside a Time Exceeded / Destination Unreachable message.
+// inside a Time Exceeded / Destination Unreachable message. It only matches when
+// the quoted packet is an echo request, so quoted traffic from some other
+// program that happens to collide on id can't be mistaken for one of our probes.
 func extractEcho(data []byte, proto int) (id, seq uint16, ok bool) {
 	var ipHdrLen int
+	var echoRequest byte
 	switch proto {
 	case protoICMP4:
 		if len(data) < 1 {
 			return 0, 0, false
 		}
 		ipHdrLen = int(data[0]&0x0f) * 4
+		echoRequest = 8
 	case protoICMP6:
 		ipHdrLen = 40
+		echoRequest = 128
 	default:
 		return 0, 0, false
 	}
 	// After the inner IP header: type(1) code(1) checksum(2) id(2) seq(2).
 	if len(data) < ipHdrLen+8 {
+		return 0, 0, false
+	}
+	if data[ipHdrLen] != echoRequest {
 		return 0, 0, false
 	}
 	id = binary.BigEndian.Uint16(data[ipHdrLen+4 : ipHdrLen+6])
@@ -368,10 +408,20 @@ func (e *engine) recordReply(seq uint16, peer net.Addr) {
 		return
 	}
 	delete(e.s.pending, seq)
-	pp.s.rtt = time.Since(pp.sentAt)
+	rtt := time.Since(pp.sentAt)
+	wasLost := pp.s.state == Lost
+	pp.s.rtt = rtt
 	pp.s.state = OK
 
 	h := e.s.getHop(pp.ttl)
+	if wasLost {
+		// The sweeper already counted this probe lost; the reply straggled in
+		// inside the grace window, so credit it back and repair the stats.
+		pp.s.late = true
+		h.creditOK(rtt, pp.sentAt)
+	} else {
+		h.noteOK(rtt, pp.sentAt)
+	}
 	newAddr := addr != nil && (h.addr == nil || !h.addr.Equal(addr))
 	if addr != nil {
 		h.addr = addr
@@ -383,6 +433,8 @@ func (e *engine) recordReply(seq uint16, peer net.Addr) {
 		// left on a CGNAT IP). They re-resolve below for the new address.
 		h.host = ""
 		h.asn = ""
+		h.hostDone = false
+		h.asnDone = false
 	}
 	ttl := pp.ttl
 	e.s.mu.Unlock()
@@ -398,14 +450,15 @@ func (e *engine) recordReply(seq uint16, peer net.Addr) {
 func (e *engine) resolveASN(ttl int, addr net.IP) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	label := lookupASN(ctx, addr)
-	if label == "" {
-		return
-	}
+	label, settled := lookupASN(ctx, addr)
+
 	e.s.mu.Lock()
 	defer e.s.mu.Unlock()
 	if h := e.s.hops[ttl]; h != nil && h.addr != nil && h.addr.Equal(addr) {
-		h.asn = label
+		if label != "" {
+			h.asn = label
+		}
+		h.asnDone = settled // a transient failure leaves it false for the retry loop
 	}
 }
 
@@ -413,18 +466,27 @@ func (e *engine) resolveHost(ttl int, addr net.IP) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	names, err := net.DefaultResolver.LookupAddr(ctx, addr.String())
-	if err != nil || len(names) == 0 {
-		return
-	}
-	name := strings.TrimSuffix(names[0], ".")
-	if isBogusPTR(name) {
-		return // leave host empty; the view falls back to the raw IP
+
+	// Settled means retrying is pointless: the lookup answered (even with a
+	// bogus name) or the name definitively does not exist. Transient failures
+	// (timeout, servfail — e.g. DNS still down during a dropout) stay unsettled
+	// so resolveLoop retries them.
+	var dnsErr *net.DNSError
+	settled := err == nil || (errors.As(err, &dnsErr) && dnsErr.IsNotFound)
+	name := ""
+	if err == nil && len(names) > 0 {
+		if n := strings.TrimSuffix(names[0], "."); !isBogusPTR(n) {
+			name = n // a bogus PTR leaves host empty; the view falls back to the raw IP
+		}
 	}
 
 	e.s.mu.Lock()
 	defer e.s.mu.Unlock()
 	if h := e.s.hops[ttl]; h != nil && h.addr != nil && h.addr.Equal(addr) {
-		h.host = name
+		if name != "" {
+			h.host = name
+		}
+		h.hostDone = settled
 	}
 }
 
@@ -437,16 +499,71 @@ func (e *engine) sweepLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			now := time.Now()
-			e.s.mu.Lock()
-			for seq, pp := range e.s.pending {
-				if now.Sub(pp.sentAt) > e.opts.Timeout {
-					pp.s.state = Lost
-					delete(e.s.pending, seq)
-				}
+			e.sweep(time.Now())
+		}
+	}
+}
+
+// sweep decides overdue probes: past the timeout a probe is marked Lost (so the
+// UI shows the loss promptly) but stays matchable so a straggling reply can
+// still credit it; past the grace window it is pruned for good.
+func (e *engine) sweep(now time.Time) {
+	grace := lateGrace
+	if g := 2 * e.opts.Timeout; g > grace {
+		grace = g // an unusually long -t must not out-live its own grace
+	}
+	e.s.mu.Lock()
+	for seq, pp := range e.s.pending {
+		age := now.Sub(pp.sentAt)
+		switch {
+		case age > grace:
+			delete(e.s.pending, seq)
+		case pp.s.state == Pending && age > e.opts.Timeout:
+			pp.s.state = Lost
+			e.s.getHop(pp.ttl).noteLost()
+		}
+	}
+	e.s.updateOutagesLocked(now)
+	e.s.mu.Unlock()
+}
+
+// resolveLoop periodically re-kicks reverse-DNS and ASN lookups for hops still
+// missing them — a transient failure at discovery time (DNS still down while a
+// dropout recovers) must not leave a hop unlabeled for the rest of the run.
+func (e *engine) resolveLoop(ctx context.Context) {
+	ticker := time.NewTicker(resolveRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		type job struct {
+			ttl        int
+			addr       net.IP
+			host, asnq bool
+		}
+		var jobs []job
+		e.s.mu.Lock()
+		for ttl, h := range e.s.hops {
+			if h.addr == nil {
+				continue
 			}
-			e.s.updateOutagesLocked(now)
-			e.s.mu.Unlock()
+			needHost := !h.hostDone
+			needASN := e.opts.LookupASN && !h.asnDone
+			if needHost || needASN {
+				jobs = append(jobs, job{ttl, h.addr, needHost, needASN})
+			}
+		}
+		e.s.mu.Unlock()
+		for _, j := range jobs {
+			if j.host {
+				go e.resolveHost(j.ttl, j.addr)
+			}
+			if j.asnq {
+				go e.resolveASN(j.ttl, j.addr)
+			}
 		}
 	}
 }

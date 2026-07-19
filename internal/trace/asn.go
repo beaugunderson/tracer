@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -14,59 +15,73 @@ var asnNameCache sync.Map
 // asnRename shortens a few well-known AS handles for the narrow ASN column.
 var asnRename = map[string]string{"SPACEX-STARLINK": "STARLINK"}
 
-// lookupASN returns a short "AS<n> NAME" label for an IP using Team Cymru's
-// DNS-based IP-to-ASN service, or "" if the address has no routable origin AS.
-//
-// It is two TXT lookups: the origin zone maps the IP to its origin ASN, and the
-// ASN zone maps that number to a name.
-func lookupASN(ctx context.Context, ip net.IP) string {
+// lookupASN returns a short AS-name label for an IP using Team Cymru's
+// DNS-based IP-to-ASN service. settled reports whether the answer is final: a
+// transient lookup failure (DNS down mid-dropout) returns settled=false so the
+// caller's retry loop tries again, while "this address has no origin AS" is
+// final. It is two TXT lookups: the origin zone maps the IP to its origin ASN,
+// and the ASN zone maps that number to a name.
+func lookupASN(ctx context.Context, ip net.IP) (label string, settled bool) {
 	if !routableForASN(ip) {
-		return ""
+		return "", true
 	}
 	zone := cymruOriginZone(ip)
 	if zone == "" {
-		return ""
+		return "", true
 	}
 	txts, err := net.DefaultResolver.LookupTXT(ctx, zone)
-	if err != nil || len(txts) == 0 {
-		return ""
+	if err != nil {
+		var dnsErr *net.DNSError
+		return "", errors.As(err, &dnsErr) && dnsErr.IsNotFound // NXDOMAIN = unannounced prefix, final
+	}
+	if len(txts) == 0 {
+		return "", true
 	}
 	// e.g. "15169 | 8.8.8.0/24 | US | arin | 1992-12-01"; field 1 may list
 	// several space-separated ASNs for a multi-origin prefix — take the first.
 	asField := strings.TrimSpace(strings.SplitN(txts[0], "|", 2)[0])
 	fields := strings.Fields(asField)
 	if len(fields) == 0 || !isAllDigits(fields[0]) {
-		return ""
+		return "", true
 	}
 	num := fields[0]
-	if name := asnName(ctx, num); name != "" {
-		return name
+	name, ok := asnName(ctx, num)
+	if !ok {
+		// The number is known but the name lookup failed transiently: show the
+		// number now and let the retry loop upgrade it to the name.
+		return "AS" + num, false
 	}
-	return "AS" + num // unnamed AS: fall back to the number
+	if name == "" {
+		return "AS" + num, true // unnamed AS: fall back to the number
+	}
+	return name, true
 }
 
-func asnName(ctx context.Context, num string) string {
-	if v, ok := asnNameCache.Load(num); ok {
-		return v.(string)
+// asnName resolves an AS number to its short handle. ok=false means the lookup
+// failed transiently; failures are never cached, so a retry can succeed later.
+func asnName(ctx context.Context, num string) (name string, ok bool) {
+	if v, hit := asnNameCache.Load(num); hit {
+		return v.(string), true
 	}
-	name := ""
-	if txts, err := net.DefaultResolver.LookupTXT(ctx, "AS"+num+".asn.cymru.com"); err == nil && len(txts) > 0 {
-		// e.g. "15169 | US | arin | 2000-03-30 | GOOGLE, US"; take the last
-		// field and drop the trailing ", CC" country suffix.
-		parts := strings.Split(txts[0], "|")
-		name = strings.TrimSpace(parts[len(parts)-1])
-		if i := strings.LastIndex(name, ","); i > 0 {
-			name = strings.TrimSpace(name[:i]) // drop trailing ", CC" country
-		}
-		if i := strings.Index(name, " - "); i > 0 {
-			name = strings.TrimSpace(name[:i]) // keep the short handle, drop "- Org Name"
-		}
-		if short, ok := asnRename[name]; ok {
-			name = short
-		}
+	txts, err := net.DefaultResolver.LookupTXT(ctx, "AS"+num+".asn.cymru.com")
+	if err != nil || len(txts) == 0 {
+		return "", false
+	}
+	// e.g. "15169 | US | arin | 2000-03-30 | GOOGLE, US"; take the last
+	// field and drop the trailing ", CC" country suffix.
+	parts := strings.Split(txts[0], "|")
+	name = strings.TrimSpace(parts[len(parts)-1])
+	if i := strings.LastIndex(name, ","); i > 0 {
+		name = strings.TrimSpace(name[:i]) // drop trailing ", CC" country
+	}
+	if i := strings.Index(name, " - "); i > 0 {
+		name = strings.TrimSpace(name[:i]) // keep the short handle, drop "- Org Name"
+	}
+	if short, hit := asnRename[name]; hit {
+		name = short
 	}
 	asnNameCache.Store(num, name)
-	return name
+	return name, true
 }
 
 // cymruOriginZone builds the reversed-IP query name for the Cymru origin lookup.
